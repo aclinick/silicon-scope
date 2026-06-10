@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "silicon-scope (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "silicon-scope (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
