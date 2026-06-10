@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 
-namespace silicon_scope.Services;
+namespace SiliconScope.Core;
 
 /// <summary>
 /// Detects the NPU adapter LUID by enumerating the <c>GPU Engine</c>
@@ -13,17 +13,16 @@ namespace silicon_scope.Services;
 ///   pid_12345_luid_0x00000000_0x0000A5C2_phys_0_eng_2_engtype_3D
 /// We parse the luid_HIGH_LOW + engtype_NAME tokens.
 /// </summary>
-public sealed class NpuDetectionService
+public sealed partial class NpuDetectionService
 {
-    private static readonly Regex InstanceNameRegex = new(
-        @"luid_0x(?<high>[0-9A-Fa-f]+)_0x(?<low>[0-9A-Fa-f]+).+engtype_(?<engtype>[A-Za-z0-9]+)",
-        RegexOptions.Compiled);
+    [GeneratedRegex(@"luid_0x(?<high>[0-9A-Fa-f]+)_0x(?<low>[0-9A-Fa-f]+).+engtype_(?<engtype>[A-Za-z0-9]+)")]
+    private static partial Regex InstanceNameRegex();
 
     public NpuDetectionResult Detect()
     {
         try
         {
-            var category = new System.Diagnostics.PerformanceCounterCategory("GPU Engine");
+            var category = new PerformanceCounterCategory("GPU Engine");
             var instances = category.GetInstanceNames();
 
             // luid string -> set of engine types observed
@@ -31,7 +30,7 @@ public sealed class NpuDetectionService
 
             foreach (var instance in instances)
             {
-                var m = InstanceNameRegex.Match(instance);
+                var m = InstanceNameRegex().Match(instance);
                 if (!m.Success) continue;
                 var luid = $"0x{m.Groups["high"].Value}_0x{m.Groups["low"].Value}";
                 if (!byLuid.TryGetValue(luid, out var set))
@@ -64,5 +63,3 @@ public sealed class NpuDetectionService
         }
     }
 }
-
-public sealed record NpuDetectionResult(bool IsPresent, string? LuidToken, string DisplayName);

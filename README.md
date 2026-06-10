@@ -1,74 +1,105 @@
 # silicon-scope
 
-A tiny always-on-top window that shows live CPU / GPU / NPU usage for one
-specific process (and its children). Built so on-device AI demos have a
-focused readout you can tuck in a corner of your screen.
+A tiny terminal readout that shows live CPU / GPU / NPU usage for one specific
+process and its children. Built so on-device AI demos have a focused view you
+can pin in a Windows Terminal pane while the demo runs.
 
-> **Status**: scaffolded, not yet built. See [HANDOFF.md](HANDOFF.md) for the
-> v1 spec, lightweight constraints, and the first-session task list.
+> **Status**: v1 TUI. The earlier WinUI 3 scaffold is preserved on the
+> `archive/winui-v0` branch.
 
 ## What it does
 
 Launch with the process you want to watch:
 
 ```powershell
-silicon-scope.exe --process AudioWorker
-silicon-scope.exe --pid 12345
+silicon-scope-tui.exe --process AudioWorker
+silicon-scope-tui.exe --pid 12345
 ```
 
-A small floating window appears in the corner of your screen showing three
-numbers that update every 250 ms:
+A live panel renders in the terminal showing CPU, GPU, and NPU bars that update
+every 500 ms with a 1-second rolling average:
 
 ```
-AudioWorker.exe
-CPU  12%   GPU   0%   NPU  84%
+ AudioWorker.exe (5 procs)
+ CPU  [################------------]  53%
+ GPU  [##--------------------------]   6%
+ NPU  [######################------]  78%
 ```
 
-When the tracked process spawns child processes (Foundry Local, helper
-workers, etc.) silicon-scope automatically rolls them into the readout, so you
-see the true total load attributable to that app.
+When the tracked process spawns child processes (Foundry Local, helper workers,
+etc.) silicon-scope rolls them into the readout, so you see the true total load
+attributable to that app. Press `q` to quit.
 
-## Why
+## Why a TUI
 
-Built to support the [Contoso-Finance speech engine demo](https://github.com/EClinick/Contoso-Finance),
-where the story is "watch the NPU bar saturate when WinAI Whisper runs, watch
-the CPU bar light up when Nemotron runs". Task Manager works but is too busy,
-not on-top, and not focused on one app. silicon-scope is the dedicated readout.
+The whole point is a focused, always-visible readout during a demo. Windows
+Terminal's per-pane "Always on top" setting does the window chrome work for
+free, and a TUI lets the tool stay tiny (3.9 MB AOT-published binary, ~36 MB
+working set). The earlier WinUI 3 attempt was archived because it added a 90+
+MB framework dependency for a tool whose entire job is one panel of numbers.
 
-## Design constraints
+See [HANDOFF.md](HANDOFF.md) (superseded but preserved for context) for the
+original spec and the lightweight constraints that drove the TUI pivot.
+[spikes/README.md](spikes/README.md) has the Rust vs C# AOT measurements that
+locked in the C# stack.
 
-- **Always-on-top, tiny** (~320×120 px). Stays out of the way.
-- **One process at a time.** Want two? Launch two instances.
-- **Lightweight.** Targets < 25 MB self-contained, < 50 MB working set,
-  < 0.5% CPU overhead. See HANDOFF.md for the full lightweight playbook.
-- **No telemetry, no log files, no network.** It samples, renders, exits.
+## Pinning the readout
+
+Open a small Windows Terminal pane and toggle "Always on top" from the WT
+window menu (or the command palette: "Toggle always on top"). The pane stays
+visible over the demo app without stealing focus.
+
+## Build
+
+silicon-scope targets .NET 10, ships as a NativeAOT binary, and builds with
+`dotnet publish`.
+
+```powershell
+# Add VS Installer to PATH so vswhere.exe is found during AOT publish.
+$env:PATH = "C:\Program Files (x86)\Microsoft Visual Studio\Installer;$env:PATH"
+
+# ARM64 host (Snapdragon X)
+dotnet publish silicon-scope-tui\silicon-scope-tui.csproj -c Release -r win-arm64 -p:PublishAot=true
+
+# x64 host
+dotnet publish silicon-scope-tui\silicon-scope-tui.csproj -c Release -r win-x64 -p:PublishAot=true
+```
+
+The single-file binary lands in
+`silicon-scope-tui\bin\Release\net10.0-windows\<rid>\publish\silicon-scope-tui.exe`.
+
+### Prerequisites
+
+- .NET 10 SDK
+- Visual Studio 2022 (or VS 18 Insiders) with the C++ workload, for the MSVC
+  linker NativeAOT calls into
+- `vswhere.exe` on PATH (lives in `C:\Program Files (x86)\Microsoft Visual Studio\Installer\`)
+
+For a quick non-AOT debug run, `dotnet run --project silicon-scope-tui` works
+and skips the linker requirement.
 
 ## Hardware
 
 Built for Snapdragon X Plus (Copilot+ PC, ARM64) with a Qualcomm Hexagon NPU.
-Also runs on x64 Windows 11 boxes without an NPU; the NPU readout shows
-"no NPU on this system".
+Also runs on x64 Windows 11 boxes without an NPU; the NPU bar shows "n/a" when
+no compute-only adapter is detected.
+
+## Repository layout
+
+```
+silicon-scope.Core/      class library, services, AOT-compatible P/Invoke
+silicon-scope-tui/       Spectre.Console TUI, publishes to a single-file AOT binary
+spikes/                  Rust + C# AOT measurement spikes (preserved for posterity)
+HANDOFF.md               original v1 spec, superseded
+```
 
 ## Roadmap
 
-- **v1** (next): floating always-on-top window, single process, the spec
-  above. See HANDOFF.md.
-- **v1.5**: extract `silicon-scope.Core` as a class library and add
-  `silicon-scope-tui`, a Spectre.Console terminal variant. Same data,
-  terminal-rendered, on brand for the Copilot CLI workflow.
-
-## Build
-
-```powershell
-# On ARM64 host
-dotnet build -p:Platform=ARM64 -c Debug
-
-# On x64 host
-dotnet build -p:Platform=x64 -c Debug
-```
-
-See HANDOFF.md for the stack decision (WinUI 3 vs WPF vs WinUI 3 + NativeAOT)
-that should be made before the v1 refactor.
+- **v1** (now): TUI readout, single process with child rollup, AOT-published.
+- **v2** (maybe): direct PDH / ETW sampling if `PerformanceCounter` overhead
+  becomes a problem on long demos.
+- **v2** (maybe): a thin WinUI variant that consumes the same `Core` library,
+  if a GUI is requested.
 
 ## License
 

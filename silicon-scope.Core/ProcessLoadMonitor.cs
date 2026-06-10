@@ -1,14 +1,11 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.UI.Dispatching;
 
-namespace silicon_scope.Services;
+namespace SiliconScope.Core;
 
 /// <summary>
 /// Samples per-PID CPU, GPU, and NPU utilization at 250 ms cadence and pushes
-/// the results to three <see cref="MetricSnapshot"/> instances on the UI thread.
+/// the results to three <see cref="MetricSnapshot"/> instances.
 ///
 /// CPU is computed from <see cref="Process.TotalProcessorTime"/> deltas
 /// (faster and more robust than the Process performance counter category,
@@ -16,18 +13,25 @@ namespace silicon_scope.Services;
 ///
 /// GPU and NPU come from the <c>GPU Engine \ Utilization Percentage</c>
 /// performance counters, filtered by PID and by adapter LUID.
+///
+/// Decoupled from any UI framework: callers may pass a marshal callback
+/// (e.g. <c>DispatcherQueue.TryEnqueue</c> for a GUI consumer) to ensure
+/// snapshot mutations happen on the right thread. The TUI passes null and
+/// reads snapshots on its own render thread.
 /// </summary>
-public sealed class ProcessLoadMonitor : IDisposable
+public sealed partial class ProcessLoadMonitor : IDisposable
 {
     private static readonly TimeSpan SamplePeriod = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan StaleThreshold = TimeSpan.FromSeconds(2);
 
-    private static readonly Regex GpuInstanceRegex = new(
-        @"pid_(?<pid>\d+)_luid_0x(?<high>[0-9A-Fa-f]+)_0x(?<low>[0-9A-Fa-f]+).+engtype_(?<engtype>[A-Za-z0-9]+)",
-        RegexOptions.Compiled);
+    private static readonly Regex GpuInstanceRegex = GpuInstanceRegexImpl();
 
-    private readonly DispatcherQueue _ui;
-    private readonly NpuDetectionResult _npu;
+    [GeneratedRegex(@"pid_(?<pid>\d+)_luid_0x(?<high>[0-9A-Fa-f]+)_0x(?<low>[0-9A-Fa-f]+).+engtype_(?<engtype>[A-Za-z0-9]+)")]
+    private static partial Regex GpuInstanceRegexImpl();
+
+    private readonly Action<Action>? _marshal;
+    private readonly NpuDetectionService _npuDetector = new();
+    private NpuDetectionResult _npu;
     private readonly MetricSnapshot _cpu;
     private readonly MetricSnapshot _gpu;
     private readonly MetricSnapshot _npuMetric;
@@ -37,6 +41,7 @@ public sealed class ProcessLoadMonitor : IDisposable
 
     private IReadOnlyList<int> _trackedPids = Array.Empty<int>();
     private readonly object _pidLock = new();
+    private bool _pendingCpuReset;
 
     // CPU bookkeeping: PID -> (lastTotalProcTime, lastWallClock).
     private readonly Dictionary<int, (TimeSpan cpu, DateTime when)> _cpuSnapshots = new();
@@ -44,17 +49,17 @@ public sealed class ProcessLoadMonitor : IDisposable
     private DateTime _lastSuccessfulSample = DateTime.UtcNow;
 
     public ProcessLoadMonitor(
-        DispatcherQueue ui,
         NpuDetectionResult npu,
         MetricSnapshot cpu,
         MetricSnapshot gpu,
-        MetricSnapshot npuMetric)
+        MetricSnapshot npuMetric,
+        Action<Action>? marshal = null)
     {
-        _ui = ui;
         _npu = npu;
         _cpu = cpu;
         _gpu = gpu;
         _npuMetric = npuMetric;
+        _marshal = marshal;
 
         _npuMetric.IsAvailable = _npu.IsPresent;
         _npuMetric.Subtitle = _npu.DisplayName;
@@ -65,8 +70,9 @@ public sealed class ProcessLoadMonitor : IDisposable
         lock (_pidLock)
         {
             _trackedPids = pids.ToArray();
-            // Reset CPU snapshots so first sample doesn't show garbage spike.
-            _cpuSnapshots.Clear();
+            // Defer the CPU snapshot reset to the sampler thread so we don't
+            // race with SampleCpu() on _cpuSnapshots.
+            _pendingCpuReset = true;
         }
     }
 
@@ -79,9 +85,14 @@ public sealed class ProcessLoadMonitor : IDisposable
 
     public void Stop()
     {
-        _cts?.Cancel();
+        var cts = _cts;
+        var loop = _loop;
+        cts?.Cancel();
+        try { loop?.Wait(TimeSpan.FromSeconds(2)); }
+        catch (AggregateException) { /* OCE on cancel */ }
         _loop = null;
         _cts = null;
+        cts?.Dispose();
     }
 
     private async Task SampleLoopAsync(CancellationToken ct)
@@ -107,18 +118,39 @@ public sealed class ProcessLoadMonitor : IDisposable
     private void Sample()
     {
         int[] pids;
-        lock (_pidLock) pids = _trackedPids.ToArray();
+        bool resetCpu;
+        lock (_pidLock)
+        {
+            pids = _trackedPids.ToArray();
+            resetCpu = _pendingCpuReset;
+            _pendingCpuReset = false;
+        }
+        if (resetCpu) _cpuSnapshots.Clear();
+
+        // If we did not detect an NPU at startup (e.g. it was idle and had no
+        // perf-counter instances yet), re-attempt detection until it appears.
+        if (!_npu.IsPresent)
+        {
+            var fresh = _npuDetector.Detect();
+            if (fresh.IsPresent)
+            {
+                _npu = fresh;
+                _npuMetric.IsAvailable = true;
+                _npuMetric.Subtitle = fresh.DisplayName;
+            }
+        }
 
         if (pids.Length == 0)
         {
-            Publish(0, 0, 0, "no process selected", "no process selected", _npu.IsPresent ? "no process selected" : _npu.DisplayName, stale: false);
+            Publish(0, 0, 0,
+                "no process selected",
+                "no process selected",
+                _npu.IsPresent ? "no process selected" : _npu.DisplayName,
+                stale: false);
             return;
         }
 
-        // CPU
         var (cpuPercent, coresActive) = SampleCpu(pids);
-
-        // GPU + NPU from a single enumeration of GPU Engine instances.
         var (gpuPercent, npuPercent, gpuBreakdown, gpuAdapter) = SampleGpuAndNpu(pids);
 
         var any = cpuPercent > 0 || gpuPercent > 0 || npuPercent > 0;
@@ -129,7 +161,7 @@ public sealed class ProcessLoadMonitor : IDisposable
         var gpuSubtitle = string.IsNullOrEmpty(gpuAdapter)
             ? gpuBreakdown
             : $"{gpuAdapter} \u2022 {gpuBreakdown}";
-        var npuSubtitle = _npu.IsPresent ? _npu.DisplayName : _npu.DisplayName;
+        var npuSubtitle = _npu.DisplayName;
 
         Publish(cpuPercent, gpuPercent, npuPercent, cpuSubtitle, gpuSubtitle, npuSubtitle, stale);
     }
@@ -144,9 +176,6 @@ public sealed class ProcessLoadMonitor : IDisposable
 
         double totalCpuMs = 0;
         var alive = new HashSet<int>();
-        // Pre-build the set of currently-running PIDs so we don't throw
-        // ArgumentException (first-chance noise) from GetProcessById on
-        // processes that have exited between picker refresh and sample.
         var runningPids = new HashSet<int>();
         foreach (var rp in Process.GetProcesses())
         {
@@ -174,21 +203,16 @@ public sealed class ProcessLoadMonitor : IDisposable
             }
         }
 
-        // Clean dead PIDs.
         foreach (var dead in _cpuSnapshots.Keys.Where(k => !alive.Contains(k)).ToArray())
         {
             _cpuSnapshots.Remove(dead);
         }
 
-        // CPU% normalized to logical core count: 100% means one full core.
-        // Total cpuMs / wallMs gives cores busy; divide by core count for 0..100.
         var coresActive = totalCpuMs / wallDelta;
         var percent = Math.Min(100.0, coresActive / Environment.ProcessorCount * 100.0);
         return (percent, coresActive);
     }
 
-    // Cache of (instance name -> counter). PerformanceCounter creation is cheap
-    // but enumerating + recreating every tick is wasteful; we lazily build.
     private readonly Dictionary<string, PerformanceCounter> _gpuCounters = new();
 
     private (double gpuPercent, double npuPercent, string gpuBreakdown, string gpuAdapter)
@@ -219,8 +243,8 @@ public sealed class ProcessLoadMonitor : IDisposable
                     try
                     {
                         counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, readOnly: true);
-                        // Prime the counter; the first NextValue() on a rate counter
-                        // returns 0 but is required to seed the baseline.
+                        // Prime the counter; the first NextValue() on a rate
+                        // counter returns 0 but seeds the baseline.
                         counter.NextValue();
                         _gpuCounters[inst] = counter;
                     }
@@ -251,7 +275,6 @@ public sealed class ProcessLoadMonitor : IDisposable
                 }
             }
 
-            // Drop counters whose instance disappeared (process exit).
             var dead = _gpuCounters.Keys.Where(k => Array.IndexOf(instances, k) < 0).ToArray();
             foreach (var k in dead)
             {
@@ -278,7 +301,7 @@ public sealed class ProcessLoadMonitor : IDisposable
     private void Publish(double cpuVal, double gpuVal, double npuVal,
         string cpuSub, string gpuSub, string npuSub, bool stale)
     {
-        _ui.TryEnqueue(() =>
+        void Apply()
         {
             _cpu.Push(cpuVal);
             _cpu.Subtitle = cpuSub;
@@ -300,7 +323,10 @@ public sealed class ProcessLoadMonitor : IDisposable
                 _npuMetric.Subtitle = _npu.DisplayName;
                 _npuMetric.IsStale = false;
             }
-        });
+        }
+
+        if (_marshal is null) Apply();
+        else _marshal(Apply);
     }
 
     public void Dispose()
