@@ -14,7 +14,6 @@ namespace SiliconScope.Tui;
 /// </summary>
 internal static class Program
 {
-    private static readonly TimeSpan RenderPeriod = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan TreeRefreshPeriod = TimeSpan.FromSeconds(5);
 
     static int Main(string[] args)
@@ -209,6 +208,17 @@ internal static class Program
 
     // -- Main render loop ----------------------------------------------------
 
+    // Display state, tweened toward the live RollingAverage every frame so
+    // updates feel smooth instead of snapping. Sampler still runs at 4 Hz in
+    // Core; the renderer interpolates between samples at ~30 fps.
+    private sealed class DisplayState
+    {
+        public double Cpu, Gpu, Npu;
+    }
+
+    private static readonly TimeSpan RenderFrame = TimeSpan.FromMilliseconds(33);   // ~30 fps
+    private const double EasePerFrame = 0.22;                                       // 0..1
+
     private static void Run(int rootPid, string rootName)
     {
         var npu = new NpuDetectionService().Detect();
@@ -226,8 +236,10 @@ internal static class Program
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-        var panel = BuildPanel(rootPid, rootName, trackedPids.Count, cpu, gpu, npuMetric, npu);
-        AnsiConsole.Live(panel).Start(ctx =>
+        var state = new DisplayState();
+        var spinnerFrame = 0;
+        var panel = BuildPanel(rootPid, rootName, trackedPids.Count, state, cpu, gpu, npuMetric, npu, spinnerFrame);
+        AnsiConsole.Live(panel).Overflow(VerticalOverflow.Crop).AutoClear(false).Start(ctx =>
         {
             while (!cts.IsCancellationRequested)
             {
@@ -245,7 +257,21 @@ internal static class Program
                     lastTreeRefresh.Restart();
                 }
 
-                ctx.UpdateTarget(BuildPanel(rootPid, rootName, trackedPids.Count, cpu, gpu, npuMetric, npu));
+                // Ease displayed values toward the latest rolling average.
+                state.Cpu += (cpu.RollingAverage() - state.Cpu) * EasePerFrame;
+                state.Gpu += (gpu.RollingAverage() - state.Gpu) * EasePerFrame;
+                state.Npu += (npuMetric.RollingAverage() - state.Npu) * EasePerFrame;
+                spinnerFrame++;
+
+                try
+                {
+                    ctx.UpdateTarget(BuildPanel(rootPid, rootName, trackedPids.Count, state, cpu, gpu, npuMetric, npu, spinnerFrame));
+                }
+                catch
+                {
+                    // Console resize / write race with another process: skip
+                    // this frame, the next one will redraw cleanly.
+                }
 
                 var quit = false;
                 while (Console.KeyAvailable)
@@ -259,7 +285,7 @@ internal static class Program
                 }
                 if (quit) break;
 
-                Thread.Sleep(RenderPeriod);
+                Thread.Sleep(RenderFrame);
             }
         });
 
@@ -270,65 +296,147 @@ internal static class Program
         int rootPid,
         string rootName,
         int pidCount,
+        DisplayState state,
         MetricSnapshot cpu,
         MetricSnapshot gpu,
         MetricSnapshot npuMetric,
-        NpuDetectionResult npu)
+        NpuDetectionResult npu,
+        int spinnerFrame)
     {
         var grid = new Grid();
-        grid.AddColumn(new GridColumn().NoWrap().Width(5));
-        grid.AddColumn(new GridColumn().Width(12));
-        grid.AddColumn(new GridColumn().PadLeft(2));
+        grid.AddColumn(new GridColumn().NoWrap());                  // label
+        grid.AddColumn(new GridColumn().NoWrap().PadLeft(2));        // sparkline
+        grid.AddColumn(new GridColumn().NoWrap().PadLeft(2));        // value
 
-        AddRow(grid, "CPU", cpu, available: true);
-        AddRow(grid, "GPU", gpu, available: true);
-        AddRow(grid, "NPU", npuMetric, available: npu.IsPresent);
+        AddRow(grid, "cpu", state.Cpu, cpu, available: true);
+        AddRow(grid, "gpu", state.Gpu, gpu, available: true);
+        AddRow(grid, "npu", state.Npu, npuMetric, available: npu.IsPresent);
 
-        var title = pidCount > 1
-            ? $" [bold]{Markup.Escape(rootName)}[/] [dim](pid {rootPid} + {pidCount - 1})[/] "
-            : $" [bold]{Markup.Escape(rootName)}[/] [dim](pid {rootPid})[/] ";
+        // Tiny breathing dot in the header so the user can tell it is live.
+        const string spinner = "\u2022\u00b0\u2218\u00b0";  // • ° ∘ °
+        var s = spinner[spinnerFrame % spinner.Length];
+        var titleSuffix = pidCount > 1
+            ? $" [grey](pid {rootPid} \u00b7 +{pidCount - 1})[/] "
+            : $" [grey](pid {rootPid})[/] ";
+        var title = $" [bold]{Markup.Escape(rootName)}[/]{titleSuffix}[cyan1]{s}[/] ";
 
         return new Panel(grid)
             .Header(title, Justify.Left)
-            .Border(BoxBorder.Rounded)
-            .Expand();
+            .Border(BoxBorder.Square)
+            .BorderColor(Color.Grey35)
+            .Padding(1, 0);
     }
 
-    private static void AddRow(Grid grid, string label, MetricSnapshot m, bool available)
+    private static void AddRow(Grid grid, string label, double displayed, MetricSnapshot m, bool available)
     {
         if (!available)
         {
             grid.AddRow(
                 $"[grey]{label}[/]",
-                "[grey]--[/]",
-                $"[grey]{Markup.Escape(m.Subtitle)}[/]");
+                $"[grey15]{new string(' ', SparkCells)}[/]",
+                "[grey]   n/a[/]");
             return;
         }
 
-        var avg = m.RollingAverage();
-        var bar = BuildBar(avg);
-        var valueStyle = m.IsStale ? "grey" : "white";
-        var value = $"[{valueStyle}]{avg,5:F1}%[/]";
+        var spark = RenderSparkline(m, SparkCells, m.IsStale);
+        var valueColor = m.IsStale ? "grey" : GradientHex(displayed);
+        var value = $"[{valueColor}]{displayed,5:F1}%[/]";
         grid.AddRow(
-            $"[bold]{label}[/]",
-            $"{bar} {value}",
-            $"[dim]{Markup.Escape(m.Subtitle)}[/]");
+            $"[grey]{label}[/]",
+            spark,
+            value);
     }
 
-    private static string BuildBar(double percent)
+    // -- Braille sparkline ---------------------------------------------------
+
+    private const int SparkCells = 32;
+
+    // Braille dot bit layout, low byte after U+2800:
+    //   1 4
+    //   2 5
+    //   3 6
+    //   7 8
+    // Heights 0..4 from the bottom up on left column => 0, 0x40, 0x44, 0x46, 0x47.
+    private static readonly byte[] LeftMask = { 0x00, 0x40, 0x44, 0x46, 0x47 };
+    // Right column: 0, 0x80, 0xA0, 0xB0, 0xB8.
+    private static readonly byte[] RightMask = { 0x00, 0x80, 0xA0, 0xB0, 0xB8 };
+
+    private static string RenderSparkline(MetricSnapshot m, int cells, bool stale)
     {
-        // 10-cell Unicode block bar matching btop sensibilities.
-        const int cells = 10;
-        const string fullBlock = "\u2588";    // █
-        const string lightBlock = "\u2591";   // ░
-        var clamped = Math.Clamp(percent, 0.0, 100.0);
-        var filled = (int)Math.Round(clamped / 100.0 * cells);
-        var color = clamped switch
+        var samples = cells * 2;                                      // 2 samples per braille cell
+        Span<double> buf = stackalloc double[samples];
+        var copied = m.CopyRecent(buf);
+        // Pad oldest entries with zero so the bar grows in from the right.
+        if (copied < samples)
         {
-            < 33 => "green",
-            < 66 => "yellow",
-            _ => "red"
-        };
-        return $"[{color}]{string.Concat(Enumerable.Repeat(fullBlock, filled))}[/][grey]{string.Concat(Enumerable.Repeat(lightBlock, cells - filled))}[/]";
+            var shift = samples - copied;
+            for (var i = samples - 1; i >= shift; i--) buf[i] = buf[i - shift];
+            for (var i = 0; i < shift; i++) buf[i] = 0;
+        }
+
+        var sb = new StringBuilder(cells * 18);
+        string? openColor = null;
+        for (var c = 0; c < cells; c++)
+        {
+            var leftVal = buf[c * 2];
+            var rightVal = buf[c * 2 + 1];
+            var lh = HeightFromPercent(leftVal);
+            var rh = HeightFromPercent(rightVal);
+            var ch = (char)(0x2800 + LeftMask[lh] + RightMask[rh]);
+
+            var avg = (leftVal + rightVal) * 0.5;
+            var color = stale ? "grey50" : (lh + rh == 0 ? "grey15" : GradientHex(avg));
+
+            if (color != openColor)
+            {
+                if (openColor is not null) sb.Append("[/]");
+                sb.Append('[').Append(color).Append(']');
+                openColor = color;
+            }
+            sb.Append(ch);
+        }
+        if (openColor is not null) sb.Append("[/]");
+        return sb.ToString();
+    }
+
+    private static int HeightFromPercent(double percent)
+    {
+        var clamped = Math.Clamp(percent, 0.0, 100.0);
+        // 0% -> 0 dots, >0..25 -> 1, ..50 -> 2, ..75 -> 3, ..100 -> 4
+        if (clamped <= 0) return 0;
+        if (clamped < 25) return 1;
+        if (clamped < 50) return 2;
+        if (clamped < 75) return 3;
+        return 4;
+    }
+
+    // 3-stop gradient: cyan (cold) -> amber (warm) -> magenta (hot).
+    // Returns a "#RRGGBB" hex usable in Spectre markup.
+    private static string GradientHex(double percent)
+    {
+        var t = Math.Clamp(percent, 0.0, 100.0) / 100.0;
+        // (R, G, B) stops
+        (int r, int g, int b) cold = (0x4C, 0xC9, 0xE6);   // soft cyan
+        (int r, int g, int b) warm = (0xF5, 0xC2, 0x42);   // amber
+        (int r, int g, int b) hot  = (0xE0, 0x4F, 0xC0);   // magenta
+
+        (int r, int g, int b) c;
+        if (t < 0.5)
+        {
+            var u = t / 0.5;
+            c = Lerp(cold, warm, u);
+        }
+        else
+        {
+            var u = (t - 0.5) / 0.5;
+            c = Lerp(warm, hot, u);
+        }
+        return $"#{c.r:X2}{c.g:X2}{c.b:X2}";
+
+        static (int r, int g, int b) Lerp((int r, int g, int b) a, (int r, int g, int b) b, double u)
+        {
+            int Mix(int x, int y) => (int)Math.Round(x + (y - x) * u);
+            return (Mix(a.r, b.r), Mix(a.g, b.g), Mix(a.b, b.b));
+        }
     }
 }

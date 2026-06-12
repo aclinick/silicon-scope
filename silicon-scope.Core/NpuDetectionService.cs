@@ -50,7 +50,7 @@ public sealed partial class NpuDetectionService
                     return new NpuDetectionResult(
                         IsPresent: true,
                         LuidToken: kv.Key,
-                        DisplayName: "Compute accelerator detected (likely Hexagon NPU)");
+                        DisplayName: $"compute adapter {kv.Key}");
                 }
             }
 
