@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using SiliconScope.Core;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 
 namespace SiliconScope.Tui;
 
@@ -238,8 +239,8 @@ internal static class Program
 
         var state = new DisplayState();
         var spinnerFrame = 0;
-        var panel = BuildPanel(rootPid, rootName, trackedPids.Count, state, cpu, gpu, npuMetric, npu, spinnerFrame);
-        AnsiConsole.Live(panel).Overflow(VerticalOverflow.Crop).AutoClear(false).Start(ctx =>
+        var renderable = BuildRenderable(rootPid, rootName, trackedPids.Count, state, cpu, gpu, npuMetric, npu, spinnerFrame);
+        AnsiConsole.Live(renderable).Overflow(VerticalOverflow.Crop).AutoClear(false).Start(ctx =>
         {
             while (!cts.IsCancellationRequested)
             {
@@ -265,7 +266,7 @@ internal static class Program
 
                 try
                 {
-                    ctx.UpdateTarget(BuildPanel(rootPid, rootName, trackedPids.Count, state, cpu, gpu, npuMetric, npu, spinnerFrame));
+                    ctx.UpdateTarget(BuildRenderable(rootPid, rootName, trackedPids.Count, state, cpu, gpu, npuMetric, npu, spinnerFrame));
                 }
                 catch
                 {
@@ -292,7 +293,7 @@ internal static class Program
         monitor.Stop();
     }
 
-    private static Panel BuildPanel(
+    private static IRenderable BuildRenderable(
         int rootPid,
         string rootName,
         int pidCount,
@@ -318,13 +319,12 @@ internal static class Program
         var titleSuffix = pidCount > 1
             ? $" [grey](pid {rootPid} \u00b7 +{pidCount - 1})[/] "
             : $" [grey](pid {rootPid})[/] ";
-        var title = $" [bold]{Markup.Escape(rootName)}[/]{titleSuffix}[cyan1]{s}[/] ";
+        var titleMarkup = new Markup($"[bold]{Markup.Escape(rootName)}[/]{titleSuffix}[cyan1]{s}[/]");
 
-        return new Panel(grid)
-            .Header(title, Justify.Left)
-            .Border(BoxBorder.Square)
-            .BorderColor(Color.Grey35)
-            .Padding(1, 0);
+        // Stack title above grid with one spacer row. No panel, no border:
+        // Spectre's box-drawing math fights any width change and leaves a trail
+        // of half-drawn boxes on resize. Stripping the chrome is the fix.
+        return new Rows(titleMarkup, new Text(string.Empty), grid);
     }
 
     private static void AddRow(Grid grid, string label, double displayed, MetricSnapshot m, bool available)
